@@ -355,6 +355,21 @@ class TestStreamingExtraction:
                         args_text += arg
         return args_text
 
+    def _collect_arguments_by_index(self, results):
+        """Collect streamed argument deltas by tool-call index."""
+        args_by_index: dict[int, str] = {}
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    func = tc.function if isinstance(tc.function, dict) else tc.function
+                    if isinstance(func, dict):
+                        arg = func.get("arguments", "")
+                    else:
+                        arg = getattr(func, "arguments", "") or ""
+                    if arg:
+                        args_by_index[tc.index] = args_by_index.get(tc.index, "") + arg
+        return args_by_index
+
     def _collect_function_name(self, results):
         """Extract the function name from streaming results."""
         for delta, _ in results:
@@ -597,6 +612,26 @@ class TestStreamingExtraction:
         assert "<|" not in args_text, (
             f"Partial delimiter leaked into JSON: {args_text!r}"
         )
+
+    def test_streaming_mtp_chunk_crossing_tool_call_boundary(
+        self, parser, mock_request
+    ):
+        """MTP-sized deltas can contain one call's end and the next call's start."""
+        chunks = [
+            "<|tool_call>",
+            "call:getStationInfo{",
+            'location:<|"|>Milano<|"|>}<tool_call|>'
+            "<|tool_call>call:getStationInfo{",
+            'location:<|"|>Piacenza<|"|>}',
+            "<tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        args_by_index = self._collect_arguments_by_index(results)
+
+        assert set(args_by_index) == {0, 1}
+        assert json.loads(args_by_index[0]) == {"location": "Milano"}
+        assert json.loads(args_by_index[1]) == {"location": "Piacenza"}
 
     def test_streaming_does_not_duplicate_plain_text_after_tool_call(
         self, parser, mock_request, monkeypatch

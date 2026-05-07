@@ -480,7 +480,7 @@ class Gemma4ToolParser(ToolParser):
             return None
 
         try:
-            return self._extract_streaming(
+            return self._extract_streaming_delta_segments(
                 previous_text=previous_text,
                 current_text=current_text,
                 delta_text=delta_text,
@@ -546,6 +546,109 @@ class Gemma4ToolParser(ToolParser):
             if text:
                 return DeltaMessage(content=text)
         return None
+
+    def _split_delta_text_on_tool_tokens(self, delta_text: str) -> list[str]:
+        """Split a delta so tool delimiters are processed in order."""
+        segments: list[str] = []
+        i = 0
+        while i < len(delta_text):
+            next_tokens = [
+                (idx, token)
+                for token in (self.tool_call_start_token, self.tool_call_end_token)
+                if (idx := delta_text.find(token, i)) != -1
+            ]
+            if not next_tokens:
+                segments.append(delta_text[i:])
+                break
+
+            next_idx, next_token = min(next_tokens, key=lambda item: item[0])
+            if next_idx > i:
+                segments.append(delta_text[i:next_idx])
+            segments.append(delta_text[next_idx : next_idx + len(next_token)])
+            i = next_idx + len(next_token)
+
+        return segments
+
+    def _combine_delta_messages(
+        self, messages: Sequence[DeltaMessage | None]
+    ) -> DeltaMessage | None:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: list[DeltaToolCall] = []
+        role: str | None = None
+
+        for message in messages:
+            if message is None:
+                continue
+            if message.role and role is None:
+                role = message.role
+            if message.content:
+                content_parts.append(message.content)
+            if message.reasoning:
+                reasoning_parts.append(message.reasoning)
+            if message.tool_calls:
+                tool_calls.extend(message.tool_calls)
+
+        if (
+            role is None
+            and not content_parts
+            and not reasoning_parts
+            and not tool_calls
+        ):
+            return None
+
+        return DeltaMessage(
+            role=role,
+            content="".join(content_parts) or None,
+            reasoning="".join(reasoning_parts) or None,
+            tool_calls=tool_calls,
+        )
+
+    def _extract_streaming_delta_segments(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> DeltaMessage | None:
+        if not delta_text:
+            return self._extract_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+            )
+
+        segments = self._split_delta_text_on_tool_tokens(delta_text)
+        if len(segments) == 1:
+            return self._extract_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+            )
+
+        # If delta buffering re-emits chars that were already included in
+        # upstream current_text, appending segments would duplicate text. In
+        # that rare case, keep the legacy whole-delta behavior.
+        if current_text != previous_text + delta_text:
+            return self._extract_streaming(
+                previous_text=previous_text,
+                current_text=current_text,
+                delta_text=delta_text,
+            )
+
+        messages: list[DeltaMessage | None] = []
+        segment_previous_text = previous_text
+        for segment in segments:
+            segment_current_text = segment_previous_text + segment
+            messages.append(
+                self._extract_streaming(
+                    previous_text=segment_previous_text,
+                    current_text=segment_current_text,
+                    delta_text=segment,
+                )
+            )
+            segment_previous_text = segment_current_text
+
+        return self._combine_delta_messages(messages)
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
         """Extract function name and raw argument string from partial text.
