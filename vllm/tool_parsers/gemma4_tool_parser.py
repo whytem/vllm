@@ -574,7 +574,8 @@ class Gemma4ToolParser(ToolParser):
     ) -> DeltaMessage | None:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
-        tool_calls: list[DeltaToolCall] = []
+        tool_calls_by_index: dict[int, DeltaToolCall] = {}
+        tool_call_indexes: list[int] = []
         role: str | None = None
 
         for message in messages:
@@ -587,7 +588,48 @@ class Gemma4ToolParser(ToolParser):
             if message.reasoning:
                 reasoning_parts.append(message.reasoning)
             if message.tool_calls:
-                tool_calls.extend(message.tool_calls)
+                for tool_call in message.tool_calls:
+                    if tool_call.index not in tool_calls_by_index:
+                        tool_call_indexes.append(tool_call.index)
+                        tool_calls_by_index[tool_call.index] = DeltaToolCall(
+                            id=tool_call.id,
+                            type=tool_call.type,
+                            index=tool_call.index,
+                            function=DeltaFunctionCall(
+                                name=tool_call.function.name
+                                if tool_call.function
+                                else None,
+                                arguments=tool_call.function.arguments
+                                if tool_call.function
+                                else None,
+                            ),
+                        )
+                        continue
+
+                    merged_tool_call = tool_calls_by_index[tool_call.index]
+                    if merged_tool_call.id is None and tool_call.id is not None:
+                        merged_tool_call.id = tool_call.id
+                    if merged_tool_call.type is None and tool_call.type is not None:
+                        merged_tool_call.type = tool_call.type
+
+                    if tool_call.function is None:
+                        continue
+                    if merged_tool_call.function is None:
+                        merged_tool_call.function = DeltaFunctionCall()
+
+                    if (
+                        merged_tool_call.function.name is None
+                        and tool_call.function.name is not None
+                    ):
+                        merged_tool_call.function.name = tool_call.function.name
+                    if tool_call.function.arguments is not None:
+                        merged_tool_call.function.arguments = (
+                            merged_tool_call.function.arguments or ""
+                        ) + tool_call.function.arguments
+
+        tool_calls = [
+            tool_calls_by_index[index] for index in tool_call_indexes
+        ]
 
         if (
             role is None

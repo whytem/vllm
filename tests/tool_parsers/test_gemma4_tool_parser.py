@@ -370,6 +370,22 @@ class TestStreamingExtraction:
                         args_by_index[tc.index] = args_by_index.get(tc.index, "") + arg
         return args_by_index
 
+    def _collect_arguments_by_index_collapsed_per_delta(self, results):
+        """Collect arguments like a client that coalesces indexes per chunk."""
+        args_by_index: dict[int, str] = {}
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                tool_calls_by_index = {tc.index: tc for tc in delta.tool_calls}
+                for tc in tool_calls_by_index.values():
+                    func = tc.function if isinstance(tc.function, dict) else tc.function
+                    if isinstance(func, dict):
+                        arg = func.get("arguments", "")
+                    else:
+                        arg = getattr(func, "arguments", "") or ""
+                    if arg:
+                        args_by_index[tc.index] = args_by_index.get(tc.index, "") + arg
+        return args_by_index
+
     def _collect_function_name(self, results):
         """Extract the function name from streaming results."""
         for delta, _ in results:
@@ -632,6 +648,29 @@ class TestStreamingExtraction:
         assert set(args_by_index) == {0, 1}
         assert json.loads(args_by_index[0]) == {"location": "Milano"}
         assert json.loads(args_by_index[1]) == {"location": "Piacenza"}
+
+    def test_streaming_mtp_chunk_merges_same_index_argument_segments(
+        self, parser, mock_request
+    ):
+        """Segment replay should not emit duplicate index entries per chunk."""
+        chunks = [
+            "<|tool_call>",
+            "call:write_file{",
+            'path:<|"|>src/main.rs<|"|>}<tool_call|>',
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+
+        for delta, _ in results:
+            if delta and delta.tool_calls:
+                indexes = [tc.index for tc in delta.tool_calls]
+                assert len(indexes) == len(set(indexes))
+
+        args_by_index = self._collect_arguments_by_index_collapsed_per_delta(
+            results
+        )
+        assert set(args_by_index) == {0}
+        assert json.loads(args_by_index[0]) == {"path": "src/main.rs"}
 
     def test_streaming_mtp_chunk_crossing_buffered_tool_call_boundary(
         self, parser, mock_request
