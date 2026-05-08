@@ -633,6 +633,26 @@ class TestStreamingExtraction:
         assert json.loads(args_by_index[0]) == {"location": "Milano"}
         assert json.loads(args_by_index[1]) == {"location": "Piacenza"}
 
+    def test_streaming_mtp_chunk_crossing_buffered_tool_call_boundary(
+        self, parser, mock_request
+    ):
+        """Segment replay must still run when buffering completes a delimiter."""
+        chunks = [
+            "<|tool_call>",
+            "call:getStationInfo{",
+            'location:<|"|>Milano<|"|>}<',
+            "tool_call|><|tool_call>call:getStationInfo{"
+            'location:<|"|>Piacenza<|"|>}<',
+            "tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        args_by_index = self._collect_arguments_by_index(results)
+
+        assert set(args_by_index) == {0, 1}
+        assert json.loads(args_by_index[0]) == {"location": "Milano"}
+        assert json.loads(args_by_index[1]) == {"location": "Piacenza"}
+
     def test_streaming_does_not_duplicate_plain_text_after_tool_call(
         self, parser, mock_request, monkeypatch
     ):

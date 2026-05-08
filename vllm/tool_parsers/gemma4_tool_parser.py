@@ -625,18 +625,19 @@ class Gemma4ToolParser(ToolParser):
                 delta_text=delta_text,
             )
 
-        # If delta buffering re-emits chars that were already included in
-        # upstream current_text, appending segments would duplicate text. In
-        # that rare case, keep the legacy whole-delta behavior.
-        if current_text != previous_text + delta_text:
+        messages: list[DeltaMessage | None] = []
+        segment_previous_text = self._get_segment_previous_text(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=delta_text,
+        )
+        if segment_previous_text is None:
             return self._extract_streaming(
                 previous_text=previous_text,
                 current_text=current_text,
                 delta_text=delta_text,
             )
 
-        messages: list[DeltaMessage | None] = []
-        segment_previous_text = previous_text
         for segment in segments:
             segment_current_text = segment_previous_text + segment
             messages.append(
@@ -649,6 +650,43 @@ class Gemma4ToolParser(ToolParser):
             segment_previous_text = segment_current_text
 
         return self._combine_delta_messages(messages)
+
+    def _get_segment_previous_text(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> str | None:
+        """Find the base text to replay buffered delta segments from.
+
+        ``delta_text`` may include leading characters that were buffered from
+        the previous chunk, while ``current_text`` already contains those
+        characters. It may also exclude a trailing delimiter prefix that is
+        buffered for the next chunk. Replaying delimiter segments from the
+        reconciled base avoids duplicating either side.
+        """
+        buffered_suffix = self.buffered_delta_text
+        if buffered_suffix:
+            if not current_text.endswith(buffered_suffix):
+                return None
+            processed_current_text = current_text[: -len(buffered_suffix)]
+        else:
+            processed_current_text = current_text
+
+        max_overlap = min(len(previous_text), len(delta_text))
+        for overlap_len in range(max_overlap, -1, -1):
+            if overlap_len and not previous_text.endswith(
+                delta_text[:overlap_len]
+            ):
+                continue
+
+            segment_previous_text = (
+                previous_text[:-overlap_len] if overlap_len else previous_text
+            )
+            if segment_previous_text + delta_text == processed_current_text:
+                return segment_previous_text
+
+        return None
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
         """Extract function name and raw argument string from partial text.
