@@ -648,6 +648,39 @@ class TestStreamingExtraction:
         assert json.loads(args_by_index[0]) == {"location": "Milano"}
         assert json.loads(args_by_index[1]) == {"location": "Piacenza"}
 
+    def test_streaming_mtp_chunk_closes_existing_and_completes_next_call(
+        self, parser, mock_request
+    ):
+        """One MTP delta can close one call and fully contain the next call."""
+        chunks = [
+            "<|tool_call>",
+            "call:first{x:1",
+            "}<tool_call|><|tool_call>call:second{y:2}<tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        args_by_index = self._collect_arguments_by_index(results)
+
+        assert set(args_by_index) == {0, 1}
+        assert json.loads(args_by_index[0]) == {"x": 1}
+        assert json.loads(args_by_index[1]) == {"y": 2}
+
+    def test_streaming_mtp_chunk_contains_two_complete_tool_calls(
+        self, parser, mock_request
+    ):
+        """A first streamed delta can contain two complete tool calls."""
+        chunks = [
+            "<|tool_call>call:first{x:1}<tool_call|>"
+            "<|tool_call>call:second{y:2}<tool_call|>",
+        ]
+
+        results = self._simulate_streaming(parser, mock_request, chunks)
+        args_by_index = self._collect_arguments_by_index(results)
+
+        assert set(args_by_index) == {0, 1}
+        assert json.loads(args_by_index[0]) == {"x": 1}
+        assert json.loads(args_by_index[1]) == {"y": 2}
+
     def test_streaming_mtp_chunk_merges_same_index_argument_segments(
         self, parser, mock_request
     ):
