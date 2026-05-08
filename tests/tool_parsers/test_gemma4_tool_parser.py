@@ -636,8 +636,7 @@ class TestStreamingExtraction:
         chunks = [
             "<|tool_call>",
             "call:getStationInfo{",
-            'location:<|"|>Milano<|"|>}<tool_call|>'
-            "<|tool_call>call:getStationInfo{",
+            'location:<|"|>Milano<|"|>}<tool_call|><|tool_call>call:getStationInfo{',
             'location:<|"|>Piacenza<|"|>}',
             "<tool_call|>",
         ]
@@ -666,9 +665,7 @@ class TestStreamingExtraction:
                 indexes = [tc.index for tc in delta.tool_calls]
                 assert len(indexes) == len(set(indexes))
 
-        args_by_index = self._collect_arguments_by_index_collapsed_per_delta(
-            results
-        )
+        args_by_index = self._collect_arguments_by_index_collapsed_per_delta(results)
         assert set(args_by_index) == {0}
         assert json.loads(args_by_index[0]) == {"path": "src/main.rs"}
 
@@ -680,8 +677,7 @@ class TestStreamingExtraction:
             "<|tool_call>",
             "call:getStationInfo{",
             'location:<|"|>Milano<|"|>}<',
-            "tool_call|><|tool_call>call:getStationInfo{"
-            'location:<|"|>Piacenza<|"|>}<',
+            'tool_call|><|tool_call>call:getStationInfo{location:<|"|>Piacenza<|"|>}<',
             "tool_call|>",
         ]
 

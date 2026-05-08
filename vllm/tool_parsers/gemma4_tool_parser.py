@@ -627,9 +627,7 @@ class Gemma4ToolParser(ToolParser):
                             merged_tool_call.function.arguments or ""
                         ) + tool_call.function.arguments
 
-        tool_calls = [
-            tool_calls_by_index[index] for index in tool_call_indexes
-        ]
+        tool_calls = [tool_calls_by_index[index] for index in tool_call_indexes]
 
         if (
             role is None
@@ -717,9 +715,7 @@ class Gemma4ToolParser(ToolParser):
 
         max_overlap = min(len(previous_text), len(delta_text))
         for overlap_len in range(max_overlap, -1, -1):
-            if overlap_len and not previous_text.endswith(
-                delta_text[:overlap_len]
-            ):
+            if overlap_len and not previous_text.endswith(delta_text[:overlap_len]):
                 continue
 
             segment_previous_text = (
