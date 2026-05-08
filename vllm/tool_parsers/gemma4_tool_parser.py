@@ -575,7 +575,6 @@ class Gemma4ToolParser(ToolParser):
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_calls_by_index: dict[int, DeltaToolCall] = {}
-        tool_call_indexes: list[int] = []
         role: str | None = None
 
         for message in messages:
@@ -589,45 +588,9 @@ class Gemma4ToolParser(ToolParser):
                 reasoning_parts.append(message.reasoning)
             if message.tool_calls:
                 for tool_call in message.tool_calls:
-                    if tool_call.index not in tool_calls_by_index:
-                        tool_call_indexes.append(tool_call.index)
-                        tool_calls_by_index[tool_call.index] = DeltaToolCall(
-                            id=tool_call.id,
-                            type=tool_call.type,
-                            index=tool_call.index,
-                            function=DeltaFunctionCall(
-                                name=tool_call.function.name
-                                if tool_call.function
-                                else None,
-                                arguments=tool_call.function.arguments
-                                if tool_call.function
-                                else None,
-                            ),
-                        )
-                        continue
+                    self._merge_delta_tool_call(tool_calls_by_index, tool_call)
 
-                    merged_tool_call = tool_calls_by_index[tool_call.index]
-                    if merged_tool_call.id is None and tool_call.id is not None:
-                        merged_tool_call.id = tool_call.id
-                    if merged_tool_call.type is None and tool_call.type is not None:
-                        merged_tool_call.type = tool_call.type
-
-                    if tool_call.function is None:
-                        continue
-                    if merged_tool_call.function is None:
-                        merged_tool_call.function = DeltaFunctionCall()
-
-                    if (
-                        merged_tool_call.function.name is None
-                        and tool_call.function.name is not None
-                    ):
-                        merged_tool_call.function.name = tool_call.function.name
-                    if tool_call.function.arguments is not None:
-                        merged_tool_call.function.arguments = (
-                            merged_tool_call.function.arguments or ""
-                        ) + tool_call.function.arguments
-
-        tool_calls = [tool_calls_by_index[index] for index in tool_call_indexes]
+        tool_calls = list(tool_calls_by_index.values())
 
         if (
             role is None
@@ -643,6 +606,46 @@ class Gemma4ToolParser(ToolParser):
             reasoning="".join(reasoning_parts) or None,
             tool_calls=tool_calls,
         )
+
+    def _merge_delta_tool_call(
+        self,
+        tool_calls_by_index: dict[int, DeltaToolCall],
+        tool_call: DeltaToolCall,
+    ) -> None:
+        if tool_call.index not in tool_calls_by_index:
+            tool_calls_by_index[tool_call.index] = DeltaToolCall(
+                id=tool_call.id,
+                type=tool_call.type,
+                index=tool_call.index,
+                function=DeltaFunctionCall(
+                    name=tool_call.function.name if tool_call.function else None,
+                    arguments=(
+                        tool_call.function.arguments if tool_call.function else None
+                    ),
+                ),
+            )
+            return
+
+        merged_tool_call = tool_calls_by_index[tool_call.index]
+        if merged_tool_call.id is None and tool_call.id is not None:
+            merged_tool_call.id = tool_call.id
+        if merged_tool_call.type is None and tool_call.type is not None:
+            merged_tool_call.type = tool_call.type
+
+        if tool_call.function is None:
+            return
+        if merged_tool_call.function is None:
+            merged_tool_call.function = DeltaFunctionCall()
+
+        if (
+            merged_tool_call.function.name is None
+            and tool_call.function.name is not None
+        ):
+            merged_tool_call.function.name = tool_call.function.name
+        if tool_call.function.arguments is not None:
+            merged_tool_call.function.arguments = (
+                merged_tool_call.function.arguments or ""
+            ) + tool_call.function.arguments
 
     def _extract_streaming_delta_segments(
         self,
@@ -713,18 +716,20 @@ class Gemma4ToolParser(ToolParser):
         else:
             processed_current_text = current_text
 
-        max_overlap = min(len(previous_text), len(delta_text))
-        for overlap_len in range(max_overlap, -1, -1):
-            if overlap_len and not previous_text.endswith(delta_text[:overlap_len]):
-                continue
+        overlap_len = len(previous_text) + len(delta_text) - len(processed_current_text)
+        if overlap_len < 0 or overlap_len > min(len(previous_text), len(delta_text)):
+            return None
 
-            segment_previous_text = (
-                previous_text[:-overlap_len] if overlap_len else previous_text
-            )
-            if segment_previous_text + delta_text == processed_current_text:
-                return segment_previous_text
+        if overlap_len and not previous_text.endswith(delta_text[:overlap_len]):
+            return None
 
-        return None
+        segment_previous_text = (
+            previous_text[:-overlap_len] if overlap_len else previous_text
+        )
+        if segment_previous_text + delta_text != processed_current_text:
+            return None
+
+        return segment_previous_text
 
     def _extract_partial_call(self, current_text: str) -> tuple[str | None, str]:
         """Extract function name and raw argument string from partial text.
