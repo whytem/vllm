@@ -17,6 +17,8 @@ see ``vllm.tool_parsers.gemma4_utils.parse_tool_calls``.
 """
 
 import json
+import os
+from collections import Counter
 from collections.abc import Sequence
 
 import regex as re
@@ -47,6 +49,8 @@ logger = init_logger(__name__)
 TOOL_CALL_START = "<|tool_call>"
 TOOL_CALL_END = "<tool_call|>"
 STRING_DELIM = '<|"|>'
+GEMMA4_TOOL_PARSER_TELEMETRY_ENV = "VLLM_GEMMA4_TOOL_PARSER_TELEMETRY"
+GEMMA4_TOOL_PARSER_TELEMETRY_INTERVAL_ENV = "VLLM_GEMMA4_TOOL_PARSER_TELEMETRY_INTERVAL"
 
 
 # ---------------------------------------------------------------------------
@@ -349,12 +353,29 @@ class Gemma4ToolParser(ToolParser):
         # Delta buffer for handling multi-token special sequences
         self.buffered_delta_text = ""
 
+        # Temporary opt-in telemetry for validating which MTP delimiter
+        # permutations appear in practice. This only records count keys, never
+        # raw generated text.
+        self._gemma4_telemetry_enabled = os.getenv(
+            GEMMA4_TOOL_PARSER_TELEMETRY_ENV, ""
+        ).lower() in ("1", "true", "yes")
+        self._gemma4_telemetry_log_interval = self._get_telemetry_log_interval()
+        self._gemma4_telemetry_delta_count = 0
+        self._gemma4_telemetry_counts: Counter[str] = Counter()
+
     def _reset_streaming_state(self) -> None:
         """Reset all streaming state for a new request."""
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self.prev_tool_call_arr: list[dict] = []
         self.streamed_args_for_tool: list[str] = []
+
+    def _get_telemetry_log_interval(self) -> int:
+        raw_interval = os.getenv(GEMMA4_TOOL_PARSER_TELEMETRY_INTERVAL_ENV, "1")
+        try:
+            return max(1, int(raw_interval))
+        except ValueError:
+            return 1
 
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
@@ -569,6 +590,93 @@ class Gemma4ToolParser(ToolParser):
 
         return segments
 
+    def _tool_token_sequence(self, text: str) -> tuple[str, ...]:
+        """Return the ordered tool delimiter sequence in text for telemetry."""
+        events: list[str] = []
+        i = 0
+        while i < len(text):
+            start_idx = text.find(self.tool_call_start_token, i)
+            end_idx = text.find(self.tool_call_end_token, i)
+
+            if start_idx == -1 and end_idx == -1:
+                break
+            if end_idx == -1 or (start_idx != -1 and start_idx < end_idx):
+                events.append("S")
+                i = start_idx + len(self.tool_call_start_token)
+            else:
+                events.append("E")
+                i = end_idx + len(self.tool_call_end_token)
+
+        return tuple(events)
+
+    def _record_gemma4_telemetry(self, key: str) -> None:
+        if not self._gemma4_telemetry_enabled:
+            return
+        self._gemma4_telemetry_counts[key] += 1
+
+    def _record_gemma4_delta_telemetry(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        segments: Sequence[str],
+    ) -> None:
+        if not self._gemma4_telemetry_enabled:
+            return
+
+        self._gemma4_telemetry_delta_count += 1
+        event_sequence = self._tool_token_sequence(delta_text)
+        sequence_key = ">".join(event_sequence) if event_sequence else "none"
+        new_starts = current_text.count(
+            self.tool_call_start_token
+        ) - previous_text.count(self.tool_call_start_token)
+        new_ends = current_text.count(self.tool_call_end_token) - previous_text.count(
+            self.tool_call_end_token
+        )
+
+        self._record_gemma4_telemetry("delta.total")
+        self._record_gemma4_telemetry(f"delta.event_sequence.{sequence_key}")
+        self._record_gemma4_telemetry(f"delta.segment_count.{len(segments)}")
+        self._record_gemma4_telemetry(
+            f"delta.new_counts.starts_{new_starts}.ends_{new_ends}"
+        )
+
+        if len(event_sequence) > 1:
+            self._record_gemma4_telemetry("delta.multi_tool_delimiter")
+            self._record_gemma4_telemetry("segment_replay.candidate")
+        elif len(event_sequence) == 1:
+            self._record_gemma4_telemetry("delta.single_tool_delimiter")
+        else:
+            self._record_gemma4_telemetry("delta.no_tool_delimiter")
+
+        if event_sequence == ("S", "E"):
+            self._record_gemma4_telemetry("case.complete_single_call")
+        elif event_sequence == ("E", "S"):
+            self._record_gemma4_telemetry("case.close_then_open")
+        elif event_sequence == ("E", "S", "E"):
+            self._record_gemma4_telemetry("case.close_then_complete_next")
+        elif event_sequence == ("S", "E", "S", "E"):
+            self._record_gemma4_telemetry("case.two_complete_calls")
+        elif len(event_sequence) > 1:
+            self._record_gemma4_telemetry("case.other_multi_event")
+
+        if self.buffered_delta_text:
+            self._record_gemma4_telemetry("buffer.trailing_suffix")
+
+    def _maybe_log_gemma4_telemetry(self) -> None:
+        if not self._gemma4_telemetry_enabled:
+            return
+        if (
+            self._gemma4_telemetry_delta_count % self._gemma4_telemetry_log_interval
+            != 0
+        ):
+            return
+        logger.info(
+            "Gemma4 tool parser telemetry after %d streamed deltas: %s",
+            self._gemma4_telemetry_delta_count,
+            dict(sorted(self._gemma4_telemetry_counts.items())),
+        )
+
     def _combine_delta_messages(
         self, messages: Sequence[DeltaMessage | None]
     ) -> DeltaMessage | None:
@@ -626,6 +734,7 @@ class Gemma4ToolParser(ToolParser):
             )
             return
 
+        self._record_gemma4_telemetry("combine.same_index_merge")
         merged_tool_call = tool_calls_by_index[tool_call.index]
         if merged_tool_call.id is None and tool_call.id is not None:
             merged_tool_call.id = tool_call.id
@@ -661,12 +770,20 @@ class Gemma4ToolParser(ToolParser):
             )
 
         segments = self._split_delta_text_on_tool_tokens(delta_text)
+        self._record_gemma4_delta_telemetry(
+            previous_text=previous_text,
+            current_text=current_text,
+            delta_text=delta_text,
+            segments=segments,
+        )
         if len(segments) == 1:
-            return self._extract_streaming(
+            result = self._extract_streaming(
                 previous_text=previous_text,
                 current_text=current_text,
                 delta_text=delta_text,
             )
+            self._maybe_log_gemma4_telemetry()
+            return result
 
         messages: list[DeltaMessage | None] = []
         segment_previous_text = self._get_segment_previous_text(
@@ -675,12 +792,16 @@ class Gemma4ToolParser(ToolParser):
             delta_text=delta_text,
         )
         if segment_previous_text is None:
-            return self._extract_streaming(
+            self._record_gemma4_telemetry("segment_replay.fallback")
+            result = self._extract_streaming(
                 previous_text=previous_text,
                 current_text=current_text,
                 delta_text=delta_text,
             )
+            self._maybe_log_gemma4_telemetry()
+            return result
 
+        self._record_gemma4_telemetry("segment_replay.used")
         for segment in segments:
             segment_current_text = segment_previous_text + segment
             messages.append(
@@ -692,7 +813,9 @@ class Gemma4ToolParser(ToolParser):
             )
             segment_previous_text = segment_current_text
 
-        return self._combine_delta_messages(messages)
+        result = self._combine_delta_messages(messages)
+        self._maybe_log_gemma4_telemetry()
+        return result
 
     def _get_segment_previous_text(
         self,
@@ -728,6 +851,9 @@ class Gemma4ToolParser(ToolParser):
         )
         if segment_previous_text + delta_text != processed_current_text:
             return None
+
+        if overlap_len:
+            self._record_gemma4_telemetry("segment_replay.leading_overlap")
 
         return segment_previous_text
 
